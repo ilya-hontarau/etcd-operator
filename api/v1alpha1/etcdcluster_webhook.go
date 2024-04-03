@@ -17,11 +17,17 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"fmt"
+	"math"
+	"strings"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	ctrl "sigs.k8s.io/controller-runtime"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -69,7 +75,29 @@ var _ webhook.Validator = &EtcdCluster{}
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type
 func (r *EtcdCluster) ValidateCreate() (admission.Warnings, error) {
 	etcdclusterlog.Info("validate create", "name", r.Name)
-	return nil, nil
+
+	var allErrors field.ErrorList
+
+	warnings, pdbErr := r.validatePdb()
+	if pdbErr != nil {
+		allErrors = append(allErrors, pdbErr...)
+	}
+
+	if errExtraArgs := validateExtraArgs(r); errExtraArgs != nil {
+		allErrors = append(allErrors, field.Invalid(
+			field.NewPath("spec", "podSpec", "extraArgs"),
+			r.Spec.PodSpec.ExtraArgs,
+			errExtraArgs.Error()))
+	}
+
+	if len(allErrors) > 0 {
+		err := errors.NewInvalid(
+			schema.GroupKind{Group: GroupVersion.Group, Kind: "EtcdCluster"},
+			r.Name, allErrors)
+		return warnings, err
+	}
+
+	return warnings, nil
 }
 
 // ValidateUpdate implements webhook.Validator so a webhook will be registered for the type
@@ -91,6 +119,21 @@ func (r *EtcdCluster) ValidateUpdate(old runtime.Object) (admission.Warnings, er
 		)
 	}
 
+	pdbWarnings, pdbErr := r.validatePdb()
+	if pdbErr != nil {
+		allErrors = append(allErrors, pdbErr...)
+	}
+	if len(pdbWarnings) > 0 {
+		warnings = append(warnings, pdbWarnings...)
+	}
+
+	if errExtraArgs := validateExtraArgs(r); errExtraArgs != nil {
+		allErrors = append(allErrors, field.Invalid(
+			field.NewPath("spec", "podSpec", "extraArgs"),
+			r.Spec.PodSpec.ExtraArgs,
+			errExtraArgs.Error()))
+	}
+
 	if len(allErrors) > 0 {
 		err := errors.NewInvalid(
 			schema.GroupKind{Group: GroupVersion.Group, Kind: "EtcdCluster"},
@@ -105,4 +148,133 @@ func (r *EtcdCluster) ValidateUpdate(old runtime.Object) (admission.Warnings, er
 func (r *EtcdCluster) ValidateDelete() (admission.Warnings, error) {
 	etcdclusterlog.Info("validate delete", "name", r.Name)
 	return nil, nil
+}
+
+// validatePdb validates PDB fields
+func (r *EtcdCluster) validatePdb() (admission.Warnings, field.ErrorList) {
+	if r.Spec.PodDisruptionBudget == nil {
+		return nil, nil
+	}
+	pdb := r.Spec.PodDisruptionBudget
+	var warnings admission.Warnings
+	var allErrors field.ErrorList
+
+	if pdb.Spec.MinAvailable != nil && pdb.Spec.MaxUnavailable != nil {
+		allErrors = append(allErrors, field.Invalid(
+			field.NewPath("spec", "podDisruptionBudget", "minAvailable"),
+			pdb.Spec.MinAvailable.IntValue(),
+			"minAvailable is mutually exclusive with maxUnavailable"),
+		)
+		return nil, allErrors
+	}
+
+	minQuorumSize := r.CalculateQuorumSize()
+	if pdb.Spec.MinAvailable != nil {
+		minAvailable := pdb.Spec.MinAvailable.IntValue()
+		if pdb.Spec.MinAvailable.Type == intstr.String && minAvailable == 0 && pdb.Spec.MinAvailable.StrVal != "0" {
+			var percentage int
+			_, err := fmt.Sscanf(pdb.Spec.MinAvailable.StrVal, "%d%%", &percentage)
+			if err != nil {
+				allErrors = append(allErrors, field.Invalid(
+					field.NewPath("spec", "podDisruptionBudget", "minAvailable"),
+					pdb.Spec.MinAvailable.StrVal,
+					"invalid percentage value"),
+				)
+			} else {
+				minAvailable = int(math.Ceil(float64(*r.Spec.Replicas) * (float64(percentage) / 100)))
+			}
+		}
+
+		if minAvailable < 0 {
+			allErrors = append(allErrors, field.Invalid(
+				field.NewPath("spec", "podDisruptionBudget", "minAvailable"),
+				pdb.Spec.MinAvailable.IntValue(),
+				"value cannot be less than zero"),
+			)
+		}
+		if minAvailable > int(*r.Spec.Replicas) {
+			allErrors = append(allErrors, field.Invalid(
+				field.NewPath("spec", "podDisruptionBudget", "minAvailable"),
+				pdb.Spec.MinAvailable.IntValue(),
+				"value cannot be larger than number of replicas"),
+			)
+		}
+		if minAvailable < minQuorumSize {
+			warnings = append(warnings, "current number of spec.podDisruptionBudget.minAvailable can lead to loss of quorum")
+		}
+	}
+	if pdb.Spec.MaxUnavailable != nil {
+		maxUnavailable := pdb.Spec.MaxUnavailable.IntValue()
+		if pdb.Spec.MaxUnavailable.Type == intstr.String && maxUnavailable == 0 && pdb.Spec.MaxUnavailable.StrVal != "0" {
+			var percentage int
+			_, err := fmt.Sscanf(pdb.Spec.MaxUnavailable.StrVal, "%d%%", &percentage)
+			if err != nil {
+				allErrors = append(allErrors, field.Invalid(
+					field.NewPath("spec", "podDisruptionBudget", "maxUnavailable"),
+					pdb.Spec.MaxUnavailable.StrVal,
+					"invalid percentage value"),
+				)
+			} else {
+				maxUnavailable = int(math.Ceil(float64(*r.Spec.Replicas) * (float64(percentage) / 100)))
+			}
+		}
+		if maxUnavailable < 0 {
+			allErrors = append(allErrors, field.Invalid(
+				field.NewPath("spec", "podDisruptionBudget", "maxUnavailable"),
+				pdb.Spec.MaxUnavailable.IntValue(),
+				"value cannot be less than zero"),
+			)
+		}
+		if maxUnavailable > int(*r.Spec.Replicas) {
+			allErrors = append(allErrors, field.Invalid(
+				field.NewPath("spec", "podDisruptionBudget", "maxUnavailable"),
+				pdb.Spec.MaxUnavailable.IntValue(),
+				"value cannot be larger than number of replicas"),
+			)
+		}
+		if int(*r.Spec.Replicas)-maxUnavailable < minQuorumSize {
+			warnings = append(warnings, "current number of spec.podDisruptionBudget.maxUnavailable can lead to loss of quorum")
+		}
+	}
+
+	if len(allErrors) > 0 {
+		return nil, allErrors
+	}
+
+	return warnings, nil
+}
+
+func validateExtraArgs(cluster *EtcdCluster) error {
+	if len(cluster.Spec.PodSpec.ExtraArgs) == 0 {
+		return nil
+	}
+
+	systemflags := map[string]struct{}{
+		"name":                        {},
+		"listen-peer-urls":            {},
+		"listen-client-urls":          {},
+		"initial-advertise-peer-urls": {},
+		"data-dir":                    {},
+		"auto-tls":                    {},
+		"peer-auto-tls":               {},
+		"advertise-client-urls":       {},
+	}
+
+	errlist := []error{}
+
+	for name := range cluster.Spec.PodSpec.ExtraArgs {
+		if strings.HasPrefix(name, "-") || strings.HasSuffix(name, "-") {
+			errlist = append(errlist, fmt.Errorf("Extra arg should not start with dash and have trailing dash, "+
+				"but it can contain dashes in the middle. flag: %s", name))
+
+			continue
+		}
+
+		if _, exists := systemflags[name]; exists {
+			errlist = append(errlist, fmt.Errorf("can't use extra argument '%s' in .Spec.PodSpec.ExtraArgs "+
+				"because it generated by operator for cluster setup", name))
+		}
+	}
+
+	return kerrors.NewAggregate(errlist)
 }

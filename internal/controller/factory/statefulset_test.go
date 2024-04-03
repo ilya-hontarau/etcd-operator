@@ -128,7 +128,7 @@ var _ = Describe("CreateOrUpdateStatefulSet handler", func() {
 			Expect(sts.Spec.Template.ObjectMeta.Annotations).To(Equal(etcdcluster.Spec.PodSpec.PodMetadata.Annotations))
 
 			By("Checking the extraArgs")
-			Expect(sts.Spec.Template.Spec.Containers[0].Command).To(Equal(generateEtcdCommand(etcdcluster)))
+			Expect(sts.Spec.Template.Spec.Containers[0].Command).To(Equal(generateEtcdCommand()))
 
 			By("Checking the default startup probe", func() {
 				Expect(sts.Spec.Template.Spec.Containers[0].StartupProbe).To(Equal(&v1.Probe{
@@ -312,9 +312,9 @@ var _ = Describe("CreateOrUpdateStatefulSet handler", func() {
 				},
 			}
 
-			command := generateEtcdCommand(etcdcluster)
+			args := generateEtcdArgs(etcdcluster)
 
-			Expect(command).To(ContainElements([]string{
+			Expect(args).To(ContainElements([]string{
 				"--key1=value1",
 				"--key2=value2",
 			}))
